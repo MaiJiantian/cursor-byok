@@ -1,0 +1,80 @@
+name: Build Windows test installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Read app version
+        id: version
+        run: |
+          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          "version=$($config.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build test installer
+        working-directory: apps/desktop
+        run: |
+          # Test installers do not need the official updater signing secret.
+          $configPath = Join-Path $env:RUNNER_TEMP 'tauri-test.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -LiteralPath $configPath -Encoding utf8NoBOM
+          npm run tauri:build -- --bundles nsis --ci --no-sign --config $configPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect installer and checksum
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows installer, found $($installers.Count)"
+          }
+          New-Item -ItemType Directory -Path windows-test | Out-Null
+          Copy-Item -LiteralPath $installers[0].FullName -Destination windows-test
+          $hash = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installers[0].Name)" | Set-Content windows-test/SHA256SUMS.txt -Encoding utf8NoBOM
+          @{
+            version = $env:APP_VERSION
+            commit = $env:GITHUB_SHA
+            repository = $env:GITHUB_REPOSITORY
+            run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          } | ConvertTo-Json | Set-Content windows-test/build-info.json -Encoding utf8NoBOM
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-${{ steps.version.outputs.version }}-windows-x64-test
+          path: windows-test/*
+          if-no-files-found: error
+          retention-days: 14
