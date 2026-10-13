@@ -1,0 +1,62 @@
+name: Consolidate v1.0.2 release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for platform builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch 38360865980 --repo "$GITHUB_REPOSITORY" --exit-status
+      - name: Consolidate signed installers and updater manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess
+          repo = os.environ['GITHUB_REPOSITORY']
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path]))
+          def download(asset, destination):
+              with destination.open('wb') as file:
+                  subprocess.run(['gh', 'api', '-H', 'Accept: application/octet-stream',
+                      f'repos/{repo}/releases/assets/{asset["id"]}'], stdout=file, check=True)
+          source = api(f'repos/{repo}/releases/411395507')
+          target = api(f'repos/{repo}/releases/tags/v1.0.2')
+          assert target['id'] == 411399726
+          root = pathlib.Path('release-recovery')
+          root.mkdir()
+          source_manifest = None
+          for asset in source['assets']:
+              assert pathlib.Path(asset['name']).name == asset['name']
+              path = root / asset['name']
+              download(asset, path)
+              if asset['name'] == 'latest.json':
+                  source_manifest = json.loads(path.read_text())
+              else:
+                  subprocess.run(['gh', 'release', 'upload', 'v1.0.2', str(path),
+                      '--repo', repo, '--clobber'], check=True)
+          latest = next(a for a in target['assets'] if a['name'] == 'latest.json')
+          path = root / 'latest.json'
+          download(latest, path)
+          manifest = json.loads(path.read_text())
+          manifest['platforms'].update(source_manifest['platforms'])
+          for platform in manifest['platforms'].values():
+              from urllib.parse import urlparse, unquote, quote
+              asset_name = unquote(urlparse(platform['url']).path.split('/')[-1])
+              platform['url'] = f'https://github.com/{repo}/releases/latest/download/{quote(asset_name)}'
+              assert platform.get('signature')
+          assert {'windows-x86_64', 'linux-x86_64', 'darwin-aarch64', 'darwin-x86_64'} <= set(manifest['platforms'])
+          path.write_text(json.dumps(manifest, indent=2) + '\n')
+          subprocess.run(['gh', 'release', 'upload', 'v1.0.2', str(path),
+              '--repo', repo, '--clobber'], check=True)
+          print('All four platform assets and signatures consolidated successfully.')
